@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-TDOA (Time Difference of Arrival) Test Script
+Test timing differences between microphones using pre-recorded audio.
 
-Tests TDOA calculation using onset detection method.
-Works with multi-device recordings from 4record.py that have different lengths.
+This script analyzes how sound arrives at different microphones by detecting
+when the sound starts in each recording. Perfect for testing your setup!
 
 Usage:
     python3 test_tdoa.py BL.wav BR.wav TL.wav TR.wav
-    
-The script will:
-- Load 4 audio files (order: Bottom-Left, Bottom-Right, Top-Left, Top-Right)
-- Detect sound onset in each recording
-- Calculate TDOAs directly from onset times
-- Display arrival order and time delays
+
+What it does:
+- Loads 4 audio files (Bottom-Left, Bottom-Right, Top-Left, Top-Right order)
+- Finds exactly when sound starts in each recording
+- Shows which microphone heard the sound first/last
+- Calculates precise timing differences in microseconds
 """
 
 import sys
@@ -26,7 +26,7 @@ from localization.tdoa import TDOACalculator
 from config.config import SPEED_OF_SOUND, SAMPLE_RATE
 
 def read_wav(filename):
-    """Read WAV file manually"""
+    """Load audio from a WAV file (handles different formats automatically)"""
     with open(filename, 'rb') as f:
         f.read(4)  # RIFF
         f.read(4)  # file size
@@ -103,49 +103,50 @@ def find_sound_onset(audio, sample_rate, threshold_percentile=95):
 
 def align_recordings(signals, sample_rate, reference_idx=0):
     """
-    Find sound onsets in all recordings and calculate TDOAs directly.
-    Returns onsets in samples (relative to reference microphone).
+    Find when sound starts in each recording and calculate timing differences.
+
+    Uses onset detection to find exactly when each microphone heard the sound,
+    then compares all of them to see which one heard it first.
     """
-    print("\nDetecting sound onsets in each recording...")
-    
-    # Find onset in each signal
+    print("\nFinding when sound starts in each recording...")
+
+    # Detect when sound begins in each microphone
     onsets = []
     for i, sig in enumerate(signals):
         onset = find_sound_onset(sig, sample_rate)
         onsets.append(onset)
-        print(f"  Signal {i}: onset at sample {onset} ({onset/sample_rate*1000:.2f} ms)")
-    
-    # Calculate TDOAs relative to reference microphone
+        print(f"  Mic {i}: sound starts at sample {onset} ({onset/sample_rate*1000:.2f} ms)")
+
+    # Compare everything to our reference microphone
     ref_onset = onsets[reference_idx]
-    print(f"\n  Using Signal {reference_idx} as reference (onset at {ref_onset} samples)")
-    
+    print(f"\n  Using Mic {reference_idx} as reference (heard sound at {ref_onset} samples)")
+
     tdoas_samples = []
     for i, onset in enumerate(onsets):
         if i == reference_idx:
             continue
-        # Negative TDOA means signal arrives BEFORE reference
-        # Positive TDOA means signal arrives AFTER reference
+        # How much earlier/later this mic heard the sound (in samples)
         tdoa = onset - ref_onset
         tdoas_samples.append(tdoa)
         if tdoa < 0:
-            print(f"  Signal {i} TDOA: {tdoa:+d} samples ({tdoa/sample_rate*1e6:+.2f} μs) - arrives BEFORE reference")
+            print(f"  Mic {i}: {tdoa:+d} samples ({tdoa/sample_rate*1e6:+.2f} μs) - heard it FIRST")
         else:
-            print(f"  Signal {i} TDOA: {tdoa:+d} samples ({tdoa/sample_rate*1e6:+.2f} μs) - arrives AFTER reference")
-    
-    # Convert to time delays
+            print(f"  Mic {i}: {tdoa:+d} samples ({tdoa/sample_rate*1e6:+.2f} μs) - heard it LATER")
+
+    # Convert from samples to seconds
     tdoas_time = np.array(tdoas_samples) / sample_rate
-    
+
     return tdoas_time
 
 def resample_audio(audio_data, original_sr, target_sr=SAMPLE_RATE):
-    """Resample audio to target sample rate"""
+    """Change audio sample rate if needed (e.g., from 48kHz to 16kHz)"""
     if original_sr == target_sr:
-        return audio_data
-    
+        return audio_data  # Already at the right rate
+
     resampled = signal.resample_poly(audio_data, target_sr, original_sr)
     return resampled
 
-# Load files
+# Set up file loading (use command line args or defaults)
 files = sys.argv[1:5] if len(sys.argv) >= 5 else ['BL.wav', 'BR.wav', 'TL.wav', 'TR.wav']
 names = ['BL', 'BR', 'TL', 'TR']
 
@@ -159,43 +160,45 @@ original_sr = None
 print("\nLoading audio files...")
 for fname, name in zip(files, names):
     sig, sample_rate = read_wav(fname)
-    
+
     if original_sr is None:
         original_sr = sample_rate
-    
+
     print(f"{name}: {len(sig)} samples @ {sample_rate} Hz ({len(sig)/sample_rate:.3f} sec)")
     signals.append(sig)
 
-# Calculate TDOAs directly from onset detection (more accurate than GCC-PHAT for these recordings)
+# Find timing differences by detecting when sound starts in each recording
+print("\nThis method is often more accurate than cross-correlation for these types of recordings!")
 tdoas = align_recordings(signals, original_sr, reference_idx=0)
 
 print("\n" + "=" * 80)
-print("TDOA Results (relative to BL)")
+print("TIMING RESULTS (compared to BL microphone)")
 print("=" * 80)
 
 for name, tdoa in zip(names[1:], tdoas):
-    print(f"\n{name}:")
+    print(f"\n{name} microphone:")
     print(f"  Time delay:    {tdoa*1e6:+8.2f} μs  ({tdoa*1e3:+7.3f} ms)")
     print(f"  Distance diff: {tdoa*SPEED_OF_SOUND:+8.4f} m   ({tdoa*SPEED_OF_SOUND*100:+7.2f} cm)")
 
-# Arrival order
+# Figure out which microphone heard the sound first
 arrival_times = {'BL': 0.0}
 for name, tdoa in zip(names[1:], tdoas):
     arrival_times[name] = tdoa
 
+# Sort by who heard it earliest
 sorted_arrivals = sorted(arrival_times.items(), key=lambda x: x[1])
 
 print("\n" + "=" * 80)
-print("Sound Arrival Order")
+print("SOUND ARRIVAL ORDER")
 print("=" * 80)
 
-print("\nCalculated (earliest to latest):")
+print("\nFrom earliest to latest:")
 for i, (name, time) in enumerate(sorted_arrivals, 1):
     print(f"  {i}. {name}  @ {time*1e6:+8.2f} μs")
 
 calculated_order = [name for name, _ in sorted_arrivals]
 
-print(f"\nArrival order: {' → '.join(calculated_order)}")
+print(f"\nSound traveled: {' -> '.join(calculated_order)}")
 
 print("\n" + "=" * 80)
 

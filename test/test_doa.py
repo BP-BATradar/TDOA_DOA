@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Offline test: load 4 one‑second files (TL, TR, BL, BR) and print the DOA.
-Use this to validate geometry and channel order without live capture.
+Test our direction-finding system with pre-recorded audio files.
+
+Load 4 WAV files (one per microphone) and calculate where the sound came from.
+Great for testing your microphone setup without needing to make noise!
 """
 
 import sys
@@ -17,7 +19,7 @@ from config.config import SAMPLE_RATE, MIC_POSITIONS, SPEED_OF_SOUND
 
 
 def read_wav(filename):
-    """Read WAV file manually"""
+    """Load audio from a WAV file (handles different formats automatically)"""
     with open(filename, 'rb') as f:
         f.read(4)  # RIFF
         f.read(4)  # file size
@@ -53,101 +55,107 @@ def read_wav(filename):
 
 def find_sound_onset(audio, sample_rate, threshold_percentile=95):
     """
-    Find the onset of the main sound event in an audio signal.
-    Returns the sample index where significant sound begins.
+    Find when the main sound starts in an audio clip.
+
+    Looks for where the audio gets loud by analyzing energy in small time windows.
+    Returns the sample number where the interesting sound begins.
     """
-    # Calculate energy in sliding windows
+    # Break audio into small 10ms chunks and measure how loud each one is
     window_size = int(0.01 * sample_rate)  # 10ms windows
-    hop_size = window_size // 2
-    
+    hop_size = window_size // 2  # Overlap windows by 50%
+
     energy = []
     for i in range(0, len(audio) - window_size, hop_size):
         window = audio[i:i+window_size]
-        energy.append(np.sum(window**2))
-    
+        energy.append(np.sum(window**2))  # Total energy in this chunk
+
     energy = np.array(energy)
-    
-    # Find threshold based on percentile of energy values
+
+    # Set threshold at the 95th percentile (ignore background noise)
     threshold = np.percentile(energy, threshold_percentile)
-    
-    # Find first window that exceeds threshold
+
+    # Find first chunk that's louder than our threshold
     onset_windows = np.where(energy > threshold)[0]
-    
+
     if len(onset_windows) == 0:
-        return 0
-    
-    # Convert window index back to sample index
+        return 0  # No sound found, start from beginning
+
+    # Convert from chunk number back to sample number
     onset_sample = onset_windows[0] * hop_size
-    
-    # Refine by looking backward for actual onset
+
+    # Fine-tune: look closer for the exact moment sound starts
     search_start = max(0, onset_sample - window_size)
     search_region = audio[search_start:onset_sample + window_size]
-    
-    # Find first sample above 5% of max in search region
+
+    # Find first sample that's 5% as loud as the loudest in this region
     threshold_fine = np.max(np.abs(search_region)) * 0.05
     fine_onset = np.where(np.abs(search_region) > threshold_fine)[0]
-    
+
     if len(fine_onset) > 0:
         onset_sample = search_start + fine_onset[0]
-    
+
     return onset_sample
 
 def calculate_tdoas_from_onsets(signals, sample_rate, reference_idx=0):
     """
-    Calculate TDOAs directly from onset detection.
-    Returns TDOAs in seconds (relative to reference microphone).
+    Find timing differences by detecting when sound starts in each microphone.
+
+    Instead of cross-correlation, this just finds when each mic first hears the sound
+    and calculates how much earlier/later each one was compared to the reference mic.
     """
-    # Find onset in each signal
+    # Find when sound starts in each microphone recording
     onsets = []
     for sig in signals:
         onset = find_sound_onset(sig, sample_rate)
         onsets.append(onset)
-    
-    # Calculate TDOAs relative to reference microphone
+
+    # Compare all onsets to our reference microphone
     ref_onset = onsets[reference_idx]
-    
+
     tdoas_samples = []
     for i, onset in enumerate(onsets):
         if i == reference_idx:
             continue
-        # Negative TDOA means signal arrives BEFORE reference
+        # How many samples earlier/later this mic heard the sound
+        # Negative means this mic heard it BEFORE the reference
         tdoa = onset - ref_onset
         tdoas_samples.append(tdoa)
-    
-    # Convert to time delays
+
+    # Convert from sample counts to seconds
     tdoas_time = np.array(tdoas_samples) / sample_rate
-    
+
     return tdoas_time
 
 
 def test_doa_from_files(audio_files: list):
-    # Run DOA on 4 files ordered [BL, BR, TL, TR]
+    """Test direction-finding with 4 pre-recorded audio files."""
+    # Need exactly 4 files in the right order
     if len(audio_files) != 4:
-        print("Error: Exactly 4 audio files required")
+        print("Error: Need exactly 4 audio files")
         print("Order: bottom_left, bottom_right, top_left, top_right")
         sys.exit(1)
-    
+
     print("\n" + "=" * 80)
     print("TDOA Direction of Arrival - Offline Test")
     print("=" * 80)
-    
-    # Load audio files
+
+    # Load all 4 audio files
     print("\nLoading audio files...")
     signals = []
     original_sr = None
     positions = ["Bottom-Left", "Bottom-Right", "Top-Left", "Top-Right"]
-    
+
     for filepath, position in zip(audio_files, positions):
         print(f"  {position}: {filepath}")
         sig, sample_rate = read_wav(filepath)
-        
+
         if original_sr is None:
             original_sr = sample_rate
-        
+
         print(f"    {len(sig)} samples @ {sample_rate} Hz ({len(sig)/sample_rate:.3f} sec)")
         signals.append(sig)
-    
-    # Get microphone positions from config (order: BL, BR, TL, TR)
+
+    # Get where each microphone is positioned (from our config)
     mic_positions = np.array([
         MIC_POSITIONS['bottom_left'],
         MIC_POSITIONS['bottom_right'],
@@ -155,40 +163,40 @@ def test_doa_from_files(audio_files: list):
         MIC_POSITIONS['top_right']
     ])
     
-    print("\nMicrophone Array Configuration:")
+    print("\nMicrophone Array Setup:")
     for name, pos in zip(positions, mic_positions):
         print(f"  {name}: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) m")
-    
-    # Calculate TDOA using onset detection
-    print("\nCalculating TDOA using onset detection...")
+
+    # Find timing differences using onset detection
+    print("\nFinding timing differences...")
     tdoas = calculate_tdoas_from_onsets(signals, original_sr, reference_idx=0)
-    
-    print(f"\n  Time Delays (relative to Bottom-Left mic):")
+
+    print(f"\n  Timing Results (compared to Bottom-Left mic):")
     print(f"    Bottom-Right: {tdoas[0]*1e6:8.2f} μs ({tdoas[0]*SPEED_OF_SOUND:.4f} m)")
     print(f"    Top-Left:     {tdoas[1]*1e6:8.2f} μs ({tdoas[1]*SPEED_OF_SOUND:.4f} m)")
     print(f"    Top-Right:    {tdoas[2]*1e6:8.2f} μs ({tdoas[2]*SPEED_OF_SOUND:.4f} m)")
-    
-    # Initialize DOA calculator
+
+    # Set up the direction calculator with our microphone positions
     doa_calc = DOACalculator(mic_positions=mic_positions)
-    
-    # Calculate DOA
-    print("\nCalculating Direction of Arrival...")
+
+    # Convert timing differences into a direction
+    print("\nCalculating sound direction...")
     direction_vector, azimuth, elevation = doa_calc.calculate_direction(tdoas)
-    
-    # Display results
+
+    # Show the final results!
     print("\n" + "=" * 80)
     print("RESULTS")
     print("=" * 80)
-    print(f"\nDirection Vector (Cartesian):")
-    print(f"  x = {direction_vector[0]:7.4f}")
-    print(f"  y = {direction_vector[1]:7.4f}")
-    print(f"  z = {direction_vector[2]:7.4f}")
-    print(f"  |v| = {np.linalg.norm(direction_vector):.4f}")
-    
-    print(f"\nDirection (Spherical):")
-    print(f"  Azimuth:   {azimuth:6.2f}° (0° = East, 90° = North, 180° = West, 270° = South)")
-    print(f"  Elevation: {elevation:6.2f}° (0° = Horizontal, 90° = Up, -90° = Down)")
-    
+    print(f"\nDirection Vector (3D coordinates):")
+    print(f"  x = {direction_vector[0]:7.4f} (east-west)")
+    print(f"  y = {direction_vector[1]:7.4f} (north-south)")
+    print(f"  z = {direction_vector[2]:7.4f} (up-down)")
+    print(f"  Length = {np.linalg.norm(direction_vector):.4f} (should be 1.0)")
+
+    print(f"\nDirection (compass + elevation):")
+    print(f"  Azimuth:   {azimuth:6.2f}° (0° = east, 90° = north, 180° = west, 270° = south)")
+    print(f"  Elevation: {elevation:6.2f}° (0° = horizontal, 90° = straight up, -90° = straight down)")
+
     print("\n" + "=" * 80 + "\n")
 
 

@@ -4,170 +4,199 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sounddevice as sd
 from scipy.io.wavfile import write
+from scipy import signal
 from datetime import datetime
 import numpy as np
 from config.config import SAMPLE_RATE, CHUNK_DURATION
+from recording.multi_device_recorder import MultiDeviceRecorder
 
 def list_microphones():
-    """List all available audio input devices."""
+    """Show all microphones available on your system."""
     print("=" * 70)
     print("Available microphones:")
     devices = sd.query_devices()
     for i, device in enumerate(devices):
-        if device['max_input_channels'] > 0:  # Only show input devices
+        if device['max_input_channels'] > 0:  # Only show devices that can record
             print(f"[{i}] {device['name']} - Channels: {device['max_input_channels']}")
     print("=" * 70)
 
 def select_microphones():
-    """Let user select 4 microphones for recording."""
+    """Let user pick which 4 microphones to use for recording."""
     list_microphones()
-    
+
     mic_indices = []
     mic_names = []
-    
+
     print("\nPlease select 4 microphones by entering their device numbers:")
     mic_positions = ['bottom_left', 'bottom_right', 'top_left', 'top_right']
-    
+
     for position in mic_positions:
         while True:
             try:
                 idx = int(input(f"Enter device number for {position} microphone: "))
                 device = sd.query_devices(idx)
                 if device['max_input_channels'] == 0:
-                    print(f"Error: Device {idx} has no input channels. Please choose another.")
+                    print(f"Error: Device {idx} can't record audio. Please choose another.")
                     continue
                 mic_indices.append(idx)
                 mic_names.append(device['name'])
                 break
             except (ValueError, sd.PortAudioError):
                 print("Invalid device number. Please try again.")
-    
+
     return mic_indices, mic_names
 
-def record_synchronized(mic_indices, duration=CHUNK_DURATION, sample_rate=SAMPLE_RATE):
+def record_synchronized(mic_indices, duration=CHUNK_DURATION, sample_rate=SAMPLE_RATE, verbose=True):
     """
-    Record from 4 microphones simultaneously with precise synchronization.
-    
-    This function ensures all microphones start and stop at exactly the same time,
-    which is critical for TDOA calculations.
-    
+    Record a short audio clip from 4 separate microphones, perfectly synchronized.
+
+    How it works:
+    - Keeps all microphone streams open during recording (no stopping/starting)
+    - Uses hardware timing to align all mics to the exact same starting moment
+    - Gives you one clean audio chunk per microphone, ready for TDOA analysis
+
     Args:
-        mic_indices: List of 4 microphone device indices
-        duration: Recording duration in seconds (default: 1.0)
-        sample_rate: Sample rate in Hz (default: 16000)
-    
+        mic_indices: Which 4 microphone devices to use (by their system numbers)
+        duration: How long to record in seconds (default: 1.0)
+        sample_rate: Audio quality in Hz (default: 16000)
+        verbose: Show detailed info about the alignment process (default: True)
+
     Returns:
-        List of 4 numpy arrays containing the recorded audio data
+        List of 4 numpy arrays with the synchronized audio, one per microphone
     """
     if len(mic_indices) != 4:
         raise ValueError("Exactly 4 microphones are required")
-    
-    # Calculate exact number of samples for precise timing
+
     num_samples = int(duration * sample_rate)
-    
-    print(f"\nRecording from 4 microphones for {duration} seconds...")
-    print(f"Sample rate: {sample_rate} Hz")
-    print(f"Total samples per mic: {num_samples}")
-    
-    # Record from all microphones simultaneously
-    # Using individual recordings but started in quick succession for best sync
-    recordings = []
-    
-    # InputStream for better synchronization control
-    # Callback-based approach with shared timing
-    import threading
-    import queue
-    
-    # Shared structures for synchronization
-    start_event = threading.Event()
-    queues = [queue.Queue() for _ in range(4)]
-    errors = [None] * 4
-    
-    def create_callback(mic_index, q, error_list, idx):
-        """Create a callback function for each microphone."""
-        def callback(indata, frames, time_info, status):
-            if status:
-                error_list[idx] = status
-            q.put(indata.copy())
-        return callback
-    
-    # Create and start all streams
-    streams = []
-    for idx, mic_idx in enumerate(mic_indices):
-        callback = create_callback(mic_idx, queues[idx], errors, idx)
-        stream = sd.InputStream(
-            device=mic_idx,
-            channels=1,
-            samplerate=sample_rate,
-            callback=callback
-        )
-        streams.append(stream)
-    
-    # Start all streams as close together as possible
-    for stream in streams:
-        stream.start()
-    
-    # Record for specified duration
-    sd.sleep(int(duration * 1000))  # Sleep in milliseconds
-    
-    # Stop all streams
-    for stream in streams:
-        stream.stop()
-        stream.close()
-    
-    # Collect recorded data from queues
-    print("Collecting recorded data...")
-    for idx in range(4):
-        chunks = []
-        while not queues[idx].empty():
-            chunks.append(queues[idx].get())
-        
-        if chunks:
-            recording = np.concatenate(chunks, axis=0)
-            # Ensure exact length (trim or pad to num_samples)
-            if len(recording) > num_samples:
-                recording = recording[:num_samples]
-            elif len(recording) < num_samples:
-                padding = np.zeros((num_samples - len(recording), 1))
-                recording = np.vstack([recording, padding])
-            recordings.append(recording.flatten())
-        else:
-            raise RuntimeError(f"No data received from microphone {mic_indices[idx]}")
-    
-    # Check for any errors
-    for idx, error in enumerate(errors):
-        if error:
-            print(f"Warning: Microphone {mic_indices[idx]} reported status: {error}")
-    
-    print("Recording complete!")
-    return recordings
+
+    if verbose:
+        print(f"\n" + "="*70)
+        print(f"HARDWARE-TIMED SYNCHRONIZED RECORDING")
+        print(f"="*70)
+        print(f"Duration: {duration} seconds")
+        print(f"Sample rate: {sample_rate} Hz")
+        print(f"Target samples per mic: {num_samples}")
+        print(f"Recording from {len(mic_indices)} separate devices...")
+
+    # Set up the recorder that handles all the complex synchronization
+    recorder = MultiDeviceRecorder(
+        mic_indices=mic_indices,
+        sample_rate=sample_rate,
+        chunk_duration=duration,
+        blocksize=256,
+    )
+    recorder.start()
+    try:
+        block = recorder.read_chunk(timeout=5.0)  # shape: (num_samples, 4)
+    finally:
+        recorder.stop()
+
+    # Make sure we have exactly the right amount of audio
+    if block.shape[0] > num_samples:
+        block = block[:num_samples, :]  # Trim if too long
+    elif block.shape[0] < num_samples:
+        # Pad with silence if too short
+        pad = np.zeros((num_samples - block.shape[0], block.shape[1]), dtype=block.dtype)
+        block = np.vstack([block, pad])
+
+    # Split the synchronized audio back into individual microphone recordings
+    aligned_recordings = [block[:, i].copy() for i in range(4)]
+
+    if verbose:
+        print(f"\n" + "="*70)
+        print(f"All 4 recordings perfectly aligned to {num_samples} samples!")
+        print(f"="*70)
+        verify_synchronization(aligned_recordings, sample_rate)
+
+    return aligned_recordings
+
+def verify_synchronization(recordings, sample_rate, max_expected_delay_ms=5.0):
+    """
+    Check how well synchronized our microphone recordings are.
+
+    Uses cross-correlation to measure timing differences between each pair of mics.
+    If everything is working well, delays should be very small (under 5ms).
+
+    Args:
+        recordings: List of 4 audio arrays from synchronized microphones
+        sample_rate: How many samples per second our audio has
+        max_expected_delay_ms: Max delay we consider "good" sync (default: 5ms)
+    """
+    print("\nChecking how well synchronized our recordings are...")
+
+    max_delay_samples = int(max_expected_delay_ms * sample_rate / 1000)
+    sync_issues = []
+
+    # Compare every pair of microphones to check timing
+    mic_pairs = [
+        (0, 1, "bottom_left vs bottom_right"),
+        (0, 2, "bottom_left vs top_left"),
+        (0, 3, "bottom_left vs top_right"),
+        (1, 2, "bottom_right vs top_left"),
+        (1, 3, "bottom_right vs top_right"),
+        (2, 3, "top_left vs top_right")
+    ]
+
+    for mic1, mic2, pair_name in mic_pairs:
+        # Find how much one signal is delayed compared to the other
+        correlation = signal.correlate(recordings[mic1], recordings[mic2], mode='full')
+        lags = signal.correlation_lags(len(recordings[mic1]), len(recordings[mic2]), mode='full')
+
+        # Find where the signals match best
+        peak_idx = np.argmax(np.abs(correlation))
+        delay_samples = lags[peak_idx]
+        delay_ms = delay_samples * 1000 / sample_rate
+        correlation_strength = correlation[peak_idx] / (np.linalg.norm(recordings[mic1]) * np.linalg.norm(recordings[mic2]))
+
+        # Check if timing difference is small enough
+        status = "GOOD" if abs(delay_samples) <= max_delay_samples else "POOR"
+        print(f"  {pair_name}: {delay_ms:+6.2f}ms delay, correlation: {correlation_strength:.3f} {status}")
+
+        if abs(delay_samples) > max_delay_samples:
+            sync_issues.append((pair_name, delay_ms))
+
+    if sync_issues:
+        print(f"\nWARNING: SYNCHRONIZATION ISSUES DETECTED")
+        print(f"   These microphone pairs have timing delays over {max_expected_delay_ms}ms:")
+        for pair, delay in sync_issues:
+            print(f"   - {pair}: {delay:+.2f}ms delay")
+        print(f"   This could affect direction-finding accuracy. Try:")
+        print(f"   - Using mics from the same audio interface")
+        print(f"   - Lowering system audio buffer settings")
+        print(f"   - Using professional audio hardware")
+    else:
+        print(f"\nSynchronization looks great! All delays under {max_expected_delay_ms}ms.")
 
 def save_recordings(recordings, mic_names, sample_rate=SAMPLE_RATE):
     """
-    Save recorded audio from 4 microphones to individual WAV files.
-    
+    Save each microphone's audio to its own WAV file.
+
+    Creates a timestamped folder and saves each recording with a descriptive name
+    showing which position and device it came from.
+
     Args:
-        recordings: List of 4 numpy arrays with audio data
-        mic_names: List of 4 microphone names
-        sample_rate: Sample rate in Hz
+        recordings: List of 4 numpy arrays with the audio data
+        mic_names: List of 4 microphone device names
+        sample_rate: Audio sample rate in Hz
     """
+    # Create unique timestamp for this recording session
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
-    
-    # Create recordings directory if it doesn't exist
+
+    # Make sure the recordings folder exists
     os.makedirs(output_dir, exist_ok=True)
-    
+
     positions = ['bottom_left', 'bottom_right', 'top_left', 'top_right']
     filenames = []
-    
+
     for idx, (recording, position, mic_name) in enumerate(zip(recordings, positions, mic_names)):
         filename = f"mic_{position}_{timestamp}.wav"
         filepath = os.path.join(output_dir, filename)
-        
-        # Normalize to int16 range
+
+        # Convert floating-point audio to 16-bit integer format for WAV file
         audio_data = (recording * 32767).astype(np.int16)
         write(filepath, sample_rate, audio_data)
-        
+
         filenames.append(filepath)
         print(f"Saved: {filepath}")
         print(f"  Position: {position}")
@@ -178,12 +207,12 @@ def save_recordings(recordings, mic_names, sample_rate=SAMPLE_RATE):
     return filenames
 
 def main():
-    """Main function to record from 4 synchronized microphones."""
+    """Record a synchronized audio clip from 4 microphones and save to files."""
     print("=" * 70)
     print("4-Microphone Synchronized Recording System")
     print("For TDOA-based Direction of Arrival")
     print("=" * 70)
-    
+
     # Select microphones
     mic_indices, mic_names = select_microphones()
     
@@ -193,7 +222,7 @@ def main():
     for pos, idx, name in zip(positions, mic_indices, mic_names):
         print(f"  {pos}: [{idx}] {name}")
     print("=" * 70)
-    
+
     # Confirm before recording
     input("\nPress Enter to start synchronized recording...")
     
